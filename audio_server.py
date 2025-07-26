@@ -1,10 +1,12 @@
 import asyncio
+from inspect import trace
 import os
 import json
 import sys
 import datetime
 from collections import defaultdict
 import io
+import traceback
 import numpy as np
 import soundfile as sf
 import warnings
@@ -22,6 +24,7 @@ sys.path.insert(0, DJANGO_ROOT)   # Add Django project root to Python path
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "SMARTROLL.settings")
 os.environ["DJANGO_ALLOW_ASYNC_UNSAFE"] = "true"
+os.environ['FROM_SOCKET_SCRIPT'] = 'true'
 
 import django  # noqa: E402  (import after env-vars)
 django.setup()
@@ -96,41 +99,44 @@ async def send_response(writer: asyncio.StreamWriter, response_dict: dict, audio
 
 
 async def process_incoming_audio(session_id: str, auth_token: str, start_time_ms: int, audio_chunk: bytes, writer: asyncio.StreamWriter):
-    logger.info(f"Received audio chunk for session_id={session_id}")
-    buf = audio_buffers[session_id]
-    # Set start time for the very first chunk
-    if buf["count"] == 0:
-        buf["start_time"] = datetime.datetime.fromtimestamp(start_time_ms / 1000)
-        logger.debug(f"Set start_time for session_id={session_id} to {buf['start_time']}")
+    try:
+        logger.info(f"Received audio chunk for session_id={session_id}")
+        buf = audio_buffers[session_id]
+        # Set start time for the very first chunk
+        if buf["count"] == 0:
+            buf["start_time"] = datetime.datetime.fromtimestamp(start_time_ms / 1000)
+            logger.debug(f"Set start_time for session_id={session_id} to {buf['start_time']}")
 
-    buf["buffer"].extend(audio_chunk)
-    buf["count"] += 1
-    logger.debug(f"Audio buffer count for session_id={session_id}: {buf['count']}")
+        buf["buffer"].extend(audio_chunk)
+        buf["count"] += 1
+        logger.debug(f"Audio buffer count for session_id={session_id}: {buf['count']}")
 
-    if buf["count"] == 5:
-        logger.info(f"Collected 5 audio chunks for session_id={session_id}, processing...")
-        full_audio = bytes(buf["buffer"])
-        wav_io = wrap_pcm_to_wav(full_audio)
-        default_storage.save('attendances/TEST_CLASS_LATEST/teacher.wav', ContentFile(wav_io.read()))
-        wav_io.seek(0)
-        db_resp = await save_incoming_audio_chunks(
-            session_id,
-            auth_token,
-            buf["start_time"],
-            wav_io.read(),
-        )
+        if buf["count"] == 5:
+            logger.info(f"Collected 5 audio chunks for session_id={session_id}, processing...")
+            full_audio = bytes(buf["buffer"])
+            wav_io = wrap_pcm_to_wav(full_audio)
+            # default_storage.save('attendances/TEST_CLASS_LATEST/teacher.wav', ContentFile(wav_io.read()))
+            wav_io.seek(0)
+            db_resp = await save_incoming_audio_chunks(
+                session_id,
+                auth_token,
+                buf["start_time"],
+                wav_io.read(),
+            )
 
-        # Reset buffer
-        buf["buffer"].clear()
-        buf["count"] = 0
-        buf["start_time"] = None
-        logger.info(f"Audio buffer reset for session_id={session_id}")
+            # Reset buffer
+            buf["buffer"].clear()
+            buf["count"] = 0
+            buf["start_time"] = None
+            logger.info(f"Audio buffer reset for session_id={session_id}")
 
-        await send_response(
-            writer,
-            {"type": "incoming_audio_chunks", "status_code": 200 if db_resp["status"] else 500, "data": db_resp},
-        )
-
+            await send_response(
+                writer,
+                {"type": "incoming_audio_chunks", "status_code": 200 if db_resp["status"] else 500, "data": db_resp},
+            )
+    except Exception as e:
+        print(e)
+        traceback.format_exc()
 # ---------------------------------------------------------------------------
 # Database helpers (ported from socket_io_client.py)
 # ---------------------------------------------------------------------------
@@ -208,17 +214,16 @@ def get_ongoing_session_data(session_id, auth_token):
     try:
         session_obj = Session.objects.filter(session_id=session_id).first()
         if not session_obj or session_obj.active != "ongoing":
-            return {"status": False, "message": "Session inactive"}
+            return {"status": False, "session_id":session_id, "message": "Session inactive"}
         decoded = jwt.decode(auth_token, options={"verify_signature": False})
         if decoded["obj"]["profile"]["role"] != "teacher":
-            return {"status": False, "message": "Permission denied"}
+            return {"status": False,"session_id":session_id, "message": "Permission denied"}
         teacher = Teacher.objects.filter(slug=decoded["obj"]["slug"]).first()
         if session_obj.lecture.teacher != teacher:
-            return {"status": False, "message": "Permission denied"}
+            return {"status": False,"session_id":session_id, "message": "Permission denied"}
         data = SessionSerializerHistoryPresent(session_obj).data
-        return {"status": True, "data": data}
-    except Exception as e:
-        import traceback
+        return {"status": True, "data": data,"session_id":session_id}
+    except Exception as e:        
         traceback.print_exc()
         return {"status": False, "message": str(e)}
 
@@ -243,6 +248,7 @@ def save_incoming_audio_chunks(session_id, auth_token, start_time, wav_bytes):
         session_obj.features.add(feat_obj)
         return {"status": True, "message": "Audio processed"}
     except Exception as e:
+        traceback.print_exc()
         return {"status": False, "message": str(e)}
 
 
@@ -293,7 +299,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             if msg_type in ("ping", "healthcheck"):
                 logger.debug("Received ping/healthcheck event.")
                 # Respond with a generic pong so clients can perform heart-beat checks
-                await send_response(writer, {"type": "pong", "msg": "Pong from Python!"})
+                await send_response(writer, {"type": "pong", "msg": "Pong from Python!", "status_code": 200})
 
             elif msg_type == "authentication":
                 logger.info(f"Authenticating session_id={header.get('session_id')}")
